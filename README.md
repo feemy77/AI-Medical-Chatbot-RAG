@@ -11,6 +11,12 @@ An advanced, full-stack AI healthcare assistant engineered for precise disease d
 *   Bilingual Intelligence: Fully operational in both professional English and local Roman Urdu, automatically detecting the user's language and adapting the response format.
 *   Online/Offline Failover: Seamlessly switches between the advanced Groq Llama-3.3 LLM (Online Mode) and the local Hybrid RAG engine (Offline Mode) without crashing.
 
+#  Datasets & Knowledge Base
+Due to GitHub's file size constraints, the primary heavy dataset files and local AI models are excluded from this repository. However, the Hybrid RAG engine processes the following locally:
+- DDXPlus Medical Dataset: Over 10,000+ patient symptom records and clinical data (600MB+ JSON) used for pattern matching and scenario generation.
+- Symptom & Disease Base: Multiple CSV datasets mapping symptom severity, disease precautions, and comprehensive drug side-effects.
+- ClinicalBERT Embeddings: Locally cached vector embeddings optimized for offline, domain-specific medical querying without relying entirely on external APIs.
+
 # 🛠️ Tech Stack
 
 *   Backend Engineering: Python, FastAPI, SQLite
