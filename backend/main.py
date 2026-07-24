@@ -109,7 +109,7 @@ FALLBACK_MEDICINES = {
     "Diabetes":        ["METFORMIN (doctor se)", "INSULIN (doctor se)", "Diet control zaroor"],
 }
 
-# 🌟 NEW: SMART ALLERGY FILTER FUNCTION
+# 🌟 SMART ALLERGY FILTER FUNCTION
 def is_med_allergic(med_name: str, user_allergies: str) -> bool:
     if not user_allergies or user_allergies.strip().lower() in ["none", "no", "nothing", ""]:
         return False
@@ -172,7 +172,7 @@ def get_medicines(disease_name: str, allergies: str) -> list:
     safe_fallback.append("Doctor se specific medicine lein")
     return safe_fallback
 
-# ── BERT + TF-IDF SETUP ────────────────────────────────────────────────────────
+# ── BERT + TF-IDF SETUP (VERCEL SAFE BYPASS) ────────────────────────────────────
 bert_tokenizer   = None
 bert_model       = None
 disease_index    = []
@@ -182,26 +182,20 @@ tfidf_matrix     = None
 def load_bert():
     global bert_tokenizer, bert_model, disease_index, tfidf_vectorizer, tfidf_matrix
     try:
+        if not os.path.exists(BERT_DIR):
+            print(f"⚠️ {BERT_DIR} not found locally. Skipping offline BERT to ensure smooth server startup.")
+            return
+        
         from transformers import AutoTokenizer, AutoModel
         import torch
         import numpy as np
         from sklearn.feature_extraction.text import TfidfVectorizer
         
-        if not os.path.exists(BERT_DIR):
-            print(f"⚠️  {BERT_DIR} not found.")
-            return
-            
         print(f"⏳ Loading ClinicalBERT from {BERT_DIR}...")
         bert_tokenizer = AutoTokenizer.from_pretrained(BERT_DIR)
         bert_model     = AutoModel.from_pretrained(BERT_DIR)
         bert_model.eval()
         
-        def get_embedding(text):
-            inputs = bert_tokenizer(text, return_tensors="pt", truncation=True, max_length=128, padding=True)
-            with torch.no_grad():
-                outputs = bert_model(**inputs)
-            return outputs.last_hidden_state[:, 0, :].squeeze().numpy()
-            
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE, "rb") as f:
                 cache_data = pickle.load(f)
@@ -211,72 +205,13 @@ def load_bert():
             print(f"⚡ Loaded from Cache ({len(disease_index)} vectors)")
             return
             
-        print("⏳ Building Hybrid Vector Index...")
-        corpus = []
-        
-        if data_training is not None:
-            train_cols = [c for c in data_training[0].keys() if c != 'prognosis']
-            from collections import defaultdict
-            grouped = defaultdict(list)
-            for row in data_training:
-                prog = str(row.get('prognosis', '')).strip()
-                if prog: grouped[prog].append(row)
-                
-            for disease, group_rows in grouped.items():
-                symptoms = set()
-                for r in group_rows:
-                    for col in train_cols:
-                        val = str(r.get(col, '')).strip().lower()
-                        if val and val != '0' and val != 'nan':
-                            symptoms.add(val.replace("_", " "))
-                text = f"{disease} symptoms: {' '.join(symptoms)}"
-                disease_index.append({"disease": disease, "vector": get_embedding(text)})
-                corpus.append(text)
-                
-        massive_path = os.path.join(MASSIVE_DIR, "Symptom2Disease.csv")
-        data_massive = read_csv_safe(massive_path)
-        if data_massive:
-            for row in data_massive:
-                label = str(row.get('label', '')).strip()
-                text = str(row.get('text', '')).strip()
-                if label and text:
-                    disease_index.append({"disease": label, "vector": get_embedding(text)})
-                    corpus.append(text)
-
-        # ── 🌟 DDXPlus CSV Sample Integration ──
-        ddx_csv_path = os.path.join(DATASET_DIR, "ddxplus_sample.csv")
-        data_ddx = read_csv_safe(ddx_csv_path)
-        if data_ddx:
-            print("⏳ Loading DDXPlus sample into knowledge base...")
-            try:
-                count = 0
-                for row in data_ddx:
-                    if count >= 10000: break 
-                    disease_name = str(row.get('PATHOLOGY', 'Unknown')).strip()
-                    evidences = str(row.get('EVIDENCES', '')).strip()
-                    
-                    if disease_name and evidences and disease_name != 'Unknown':
-                        text = f"{disease_name} symptoms: {evidences}"
-                        disease_index.append({"disease": disease_name, "vector": get_embedding(text)})
-                        corpus.append(text)
-                        count += 1
-                print(f"✅ Successfully added {count} records from DDXPlus dataset!")
-            except Exception as e:
-                print(f"⚠️ Error loading DDXPlus CSV: {e}")
-                    
-        tfidf_vectorizer = TfidfVectorizer(stop_words='english')
-        tfidf_matrix     = tfidf_vectorizer.fit_transform(corpus)
-        
-        with open(CACHE_FILE, "wb") as f:
-            pickle.dump({'index': disease_index, 'vectorizer': tfidf_vectorizer, 'matrix': tfidf_matrix}, f)
-            
-        print("✅ Hybrid RAG Engine Ready!")
+        print("✅ Hybrid RAG Engine Bypassed for Vercel stability.")
         
     except Exception as e:
-        print(f"⚠️  BERT/TFIDF error (Safe to ignore on Vercel): {e}")
+        print(f"⚠️ BERT/TFIDF startup safe bypass: {e}")
 
-# ── SQLite ─────────────────────────────────────────────────────────────────────
-DB_NAME = os.path.join(BASE_DIR, "medical_data.db")
+# ── SQLite (VERCEL /TMP FIX) ───────────────────────────────────────────────────
+DB_NAME = "/tmp/medical_data.db"
 
 def get_db():
     conn = sqlite3.connect(DB_NAME)
@@ -284,28 +219,31 @@ def get_db():
     return conn
 
 def init_db():
-    conn = get_db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS chat_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, user_input TEXT, allergies TEXT DEFAULT 'None',
-        source TEXT, ai_response TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-        
-    conn.execute("""CREATE TABLE IF NOT EXISTS user_profiles (
-        email TEXT PRIMARY KEY, name TEXT DEFAULT 'Patient', profile_pic TEXT,
-        age TEXT DEFAULT '', gender TEXT DEFAULT '', blood_group TEXT DEFAULT '', allergies TEXT DEFAULT 'None')""")
-        
     try:
-        conn.execute("ALTER TABLE user_profiles ADD COLUMN name TEXT DEFAULT 'Patient'")
-        conn.execute("ALTER TABLE user_profiles ADD COLUMN age TEXT DEFAULT ''")
-        conn.execute("ALTER TABLE user_profiles ADD COLUMN gender TEXT DEFAULT ''")
-        conn.execute("ALTER TABLE user_profiles ADD COLUMN blood_group TEXT DEFAULT ''")
-    except: pass
-    
-    conn.execute("""CREATE TABLE IF NOT EXISTS user_chats (
-        chat_id TEXT PRIMARY KEY, user_email TEXT, title TEXT,
-        messages_json TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        conn = get_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_input TEXT, allergies TEXT DEFAULT 'None',
+            source TEXT, ai_response TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+            
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_profiles (
+            email TEXT PRIMARY KEY, name TEXT DEFAULT 'Patient', profile_pic TEXT,
+            age TEXT DEFAULT '', gender TEXT DEFAULT '', blood_group TEXT DEFAULT '', allergies TEXT DEFAULT 'None')""")
+            
+        try:
+            conn.execute("ALTER TABLE user_profiles ADD COLUMN name TEXT DEFAULT 'Patient'")
+            conn.execute("ALTER TABLE user_profiles ADD COLUMN age TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE user_profiles ADD COLUMN gender TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE user_profiles ADD COLUMN blood_group TEXT DEFAULT ''")
+        except: pass
         
-    conn.commit()
-    conn.close()
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_chats (
+            chat_id TEXT PRIMARY KEY, user_email TEXT, title TEXT,
+            messages_json TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+            
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ SQLite Init Error: {e}")
 
 def save_to_db(user_input, allergies, source, response):
     try:
@@ -613,7 +551,6 @@ OFFLINE_DIRECT_MEDICINES = {
                     "ur": {"medicines": ["⚠️ FORAN HOSPITAL JAYEN"], "precautions": ["Foran aaram karein", "Koi zor wala kaam na karein"]}}
 }
 
-# 🌟 FIX 3: ADDED ALLERGIES FILTER IN DIRECT OFFLINE TOO
 def format_offline_direct_response(symptom: str, allergies: str, lang: str) -> str:
     lang_key = "ur" if lang == "roman_urdu" else "en"
     data = OFFLINE_DIRECT_MEDICINES.get(symptom, {}).get(lang_key)
@@ -783,5 +720,5 @@ def health_check():
         "mode":             "Online (Groq LLM)" if internet else "Offline (Hybrid RAG)",
         "internet":         internet,
         "vectors_indexed":  len(disease_index),
-        "version":          "8.5.1 — Super Smart Allergy Filter Added & Vercel Optimized"
+        "version":          "8.5.2 — Vercel Bulletproof Stable Version"
     }
