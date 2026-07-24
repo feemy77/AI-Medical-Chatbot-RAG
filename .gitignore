@@ -1,0 +1,16 @@
+# Python & Backend
+__pycache__/
+*.pyc
+backend/venv/
+medical_data.db
+.env
+bert_clinicalbert_cache.pkl
+dataset_massive/
+clinicalbert_local/
+
+# Node & Frontend
+node_modules/
+build/
+.DS_Store
+backend/my-custom-bert-doctor/
+backend/dataset/release_train_patients.json
