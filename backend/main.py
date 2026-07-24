@@ -2,19 +2,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import pandas as pd
 import os
 import sqlite3
-import numpy as np
 import urllib.request
 import pickle
+import csv
 from dotenv import load_dotenv
 from datetime import datetime
 import warnings
 import json
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 warnings.filterwarnings("ignore")
 load_dotenv()
@@ -46,25 +42,39 @@ if GROQ_API_KEY:
     except Exception as e:
         print(f"⚠️  Groq setup error: {e}")
 
+# ── CSV LOADER (NO PANDAS) ─────────────────────────────────────────────────────
+def read_csv_safe(filepath):
+    if not os.path.exists(filepath): return None
+    try:
+        with open(filepath, mode='r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames:
+                reader.fieldnames = [str(c).strip() for c in reader.fieldnames if c]
+            return list(reader)
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}")
+        return None
+
 # ── DATASET LOAD ───────────────────────────────────────────────────────────────
-df_disease = df_desc = df_prec = df_drugs = df_training = None
+data_disease = data_desc = data_prec = data_drugs = data_training = None
 symptom_cols = []
 desc_col = "Description"
 
 try:
-    df_disease  = pd.read_csv(os.path.join(DATASET_DIR, "dataset.csv"))
-    df_desc     = pd.read_csv(os.path.join(DATASET_DIR, "symptom_Description.csv"))
-    df_prec     = pd.read_csv(os.path.join(DATASET_DIR, "symptom_precaution.csv"))
-    df_drugs    = pd.read_csv(os.path.join(DATASET_DIR, "drugs_side_effects_drugs_com.csv"))
-    df_training = pd.read_csv(os.path.join(DATASET_DIR, "training.csv"))
+    data_disease  = read_csv_safe(os.path.join(DATASET_DIR, "dataset.csv"))
+    data_desc     = read_csv_safe(os.path.join(DATASET_DIR, "symptom_Description.csv"))
+    data_prec     = read_csv_safe(os.path.join(DATASET_DIR, "symptom_precaution.csv"))
+    data_drugs    = read_csv_safe(os.path.join(DATASET_DIR, "drugs_side_effects_drugs_com.csv"))
+    data_training = read_csv_safe(os.path.join(DATASET_DIR, "training.csv"))
 
-    for df in [df_disease, df_desc, df_prec, df_drugs, df_training]:
-        if df is not None:
-            df.columns = df.columns.str.strip()
-
-    desc_col     = next((c for c in df_desc.columns if 'desc' in c.lower()), df_desc.columns[1])
-    symptom_cols = [c for c in df_disease.columns if c.lower() != 'disease']
-    print(f"✅ Core Datasets Loaded! {df_disease['Disease'].nunique()} base diseases")
+    if data_desc and len(data_desc) > 0:
+        desc_keys = list(data_desc[0].keys())
+        desc_col  = next((c for c in desc_keys if 'desc' in c.lower()), desc_keys[1] if len(desc_keys) > 1 else desc_keys[0])
+    
+    if data_disease and len(data_disease) > 0:
+        symptom_cols = [c for c in data_disease[0].keys() if c.lower() != 'disease']
+        unique_diseases = len(set(row.get('Disease', '') for row in data_disease if row.get('Disease')))
+        print(f"✅ Core Datasets Loaded! {unique_diseases} base diseases")
 except Exception as e:
     print(f"❌ Dataset Error: {e}")
 
@@ -103,14 +113,11 @@ FALLBACK_MEDICINES = {
 def is_med_allergic(med_name: str, user_allergies: str) -> bool:
     if not user_allergies or user_allergies.strip().lower() in ["none", "no", "nothing", ""]:
         return False
-    # Remove common words user might type (e.g., "allergy from paracetamol")
     stop_words = {"allergy", "allergic", "from", "to", "have", "i", "am", "and", "or", "with", "a", "an", "the", "my"}
     raw_words = user_allergies.replace(',', ' ').lower().split()
     actual_allergies = [w for w in raw_words if w not in stop_words and len(w) > 2]
     
-    if not actual_allergies:
-        return False
-        
+    if not actual_allergies: return False
     med_lower = med_name.lower()
     return any(alg in med_lower for alg in actual_allergies)
 
@@ -120,7 +127,7 @@ def get_medicines(disease_name: str, allergies: str) -> list:
             safe_meds = [m for m in meds if not is_med_allergic(m, allergies)]
             return safe_meds if safe_meds else ["Doctor se safe mutbadil (alternative) dawai lein (Allergy detected)"]
             
-    if df_drugs is not None:
+    if data_drugs is not None:
         try:
             condition = None
             for key, val in DISEASE_TO_CONDITION.items():
@@ -128,31 +135,36 @@ def get_medicines(disease_name: str, allergies: str) -> list:
                     condition = val
                     break
                     
-            if not condition:
-                mask    = df_drugs['medical_condition'].fillna('').str.lower().str.contains(disease_name.lower().split()[0], na=False)
-                matches = df_drugs[mask]
-            else:
-                matches = df_drugs[df_drugs['medical_condition'] == condition]
+            matches = []
+            search_term = disease_name.lower().split()[0] if disease_name.strip() else ""
+            
+            for row in data_drugs:
+                med_cond = str(row.get('medical_condition', '')).strip().lower()
+                if condition:
+                    if med_cond == condition.lower(): matches.append(row)
+                else:
+                    if search_term and search_term in med_cond: matches.append(row)
                 
-            if not matches.empty:
-                if 'rating' in matches.columns:
-                    matches = matches.sort_values('rating', ascending=False)
+            if matches:
+                def get_rating(r):
+                    try: return float(r.get('rating', 0))
+                    except: return 0.0
+                matches.sort(key=get_rating, reverse=True)
+                
                 seen = set()
                 meds = []
-                drug_col = 'drug_name' if 'drug_name' in matches.columns else next((c for c in matches.columns if 'drug' in c.lower() or 'medicine' in c.lower()), None)
+                first_match = matches[0]
+                drug_col = 'drug_name' if 'drug_name' in first_match else next((c for c in first_match if 'drug' in c.lower() or 'medicine' in c.lower()), None)
                 
                 if drug_col:
-                    for _, row in matches.iterrows():
-                        drug = str(row[drug_col]).strip()
+                    for row in matches:
+                        drug = str(row.get(drug_col, '')).strip()
                         if drug and drug.lower() not in seen and drug.lower() != 'nan':
-                            # 🌟 Apply smart allergy filter here
                             if not is_med_allergic(drug, allergies):
                                 seen.add(drug.lower())
                                 meds.append(drug.upper())
-                        if len(meds) >= 4:
-                            break
-                    if meds:
-                        return meds
+                        if len(meds) >= 4: break
+                    if meds: return meds
         except Exception as e:
             print(f"⚠️ Medicine lookup: {e}")
             
@@ -172,6 +184,8 @@ def load_bert():
     try:
         from transformers import AutoTokenizer, AutoModel
         import torch
+        import numpy as np
+        from sklearn.feature_extraction.text import TfidfVectorizer
         
         if not os.path.exists(BERT_DIR):
             print(f"⚠️  {BERT_DIR} not found.")
@@ -200,50 +214,52 @@ def load_bert():
         print("⏳ Building Hybrid Vector Index...")
         corpus = []
         
-        if df_training is not None and 'prognosis' in df_training.columns:
-            train_cols = [c for c in df_training.columns if c != 'prognosis']
-            for disease, group in df_training.groupby('prognosis'):
+        if data_training is not None:
+            train_cols = [c for c in data_training[0].keys() if c != 'prognosis']
+            from collections import defaultdict
+            grouped = defaultdict(list)
+            for row in data_training:
+                prog = str(row.get('prognosis', '')).strip()
+                if prog: grouped[prog].append(row)
+                
+            for disease, group_rows in grouped.items():
                 symptoms = set()
-                for col in train_cols:
-                    for val in group[col].dropna():
-                        s = str(val).strip().lower()
-                        if s and s != '0' and s != 'nan':
-                            symptoms.add(s.replace("_", " "))
+                for r in group_rows:
+                    for col in train_cols:
+                        val = str(r.get(col, '')).strip().lower()
+                        if val and val != '0' and val != 'nan':
+                            symptoms.add(val.replace("_", " "))
                 text = f"{disease} symptoms: {' '.join(symptoms)}"
                 disease_index.append({"disease": disease, "vector": get_embedding(text)})
                 corpus.append(text)
                 
         massive_path = os.path.join(MASSIVE_DIR, "Symptom2Disease.csv")
-        if os.path.exists(massive_path):
-            df_massive = pd.read_csv(massive_path)
-            if 'label' in df_massive.columns and 'text' in df_massive.columns:
-                for _, row in df_massive.iterrows():
-                    text = str(row['text']).strip()
-                    disease_index.append({"disease": str(row['label']).strip(), "vector": get_embedding(text)})
+        data_massive = read_csv_safe(massive_path)
+        if data_massive:
+            for row in data_massive:
+                label = str(row.get('label', '')).strip()
+                text = str(row.get('text', '')).strip()
+                if label and text:
+                    disease_index.append({"disease": label, "vector": get_embedding(text)})
                     corpus.append(text)
 
         # ── 🌟 DDXPlus CSV Sample Integration ──
         ddx_csv_path = os.path.join(DATASET_DIR, "ddxplus_sample.csv")
-        if os.path.exists(ddx_csv_path):
+        data_ddx = read_csv_safe(ddx_csv_path)
+        if data_ddx:
             print("⏳ Loading DDXPlus sample into knowledge base...")
             try:
-                df_ddx = pd.read_csv(ddx_csv_path)
                 count = 0
-                for _, row in df_ddx.iterrows():
-                    if count >= 10000:
-                        break 
-                    
+                for row in data_ddx:
+                    if count >= 10000: break 
                     disease_name = str(row.get('PATHOLOGY', 'Unknown')).strip()
                     evidences = str(row.get('EVIDENCES', '')).strip()
                     
                     if disease_name and evidences and disease_name != 'Unknown':
-                        # Evidences CSV mein text ban kar aayenge, isko directly add kar denge
                         text = f"{disease_name} symptoms: {evidences}"
-                        
                         disease_index.append({"disease": disease_name, "vector": get_embedding(text)})
                         corpus.append(text)
                         count += 1
-                        
                 print(f"✅ Successfully added {count} records from DDXPlus dataset!")
             except Exception as e:
                 print(f"⚠️ Error loading DDXPlus CSV: {e}")
@@ -257,7 +273,7 @@ def load_bert():
         print("✅ Hybrid RAG Engine Ready!")
         
     except Exception as e:
-        print(f"⚠️  BERT/TFIDF error: {e}")
+        print(f"⚠️  BERT/TFIDF error (Safe to ignore on Vercel): {e}")
 
 # ── SQLite ─────────────────────────────────────────────────────────────────────
 DB_NAME = os.path.join(BASE_DIR, "medical_data.db")
@@ -603,7 +619,6 @@ def format_offline_direct_response(symptom: str, allergies: str, lang: str) -> s
     data = OFFLINE_DIRECT_MEDICINES.get(symptom, {}).get(lang_key)
     if not data: return None
     
-    # Filter medicines by allergy
     safe_medicines = [m for m in data["medicines"] if not is_med_allergic(m, allergies)]
     if not safe_medicines:
         safe_medicines = ["Doctor se safe mutbadil dawai lein (Allergy Detected)"] if lang == "roman_urdu" else ["Consult doctor for safe alternative (Allergy Detected)"]
@@ -636,18 +651,22 @@ def normalize_for_bert(text: str) -> str:
 
 def format_disease_response(disease: str, allergies: str, lang: str) -> str:
     description = ""
-    if df_desc is not None:
-        desc_row = df_desc[df_desc['Disease'].str.lower().str.contains(disease.lower(), na=False, regex=False)]
-        if not desc_row.empty: description = desc_row[desc_col].values[0]
+    if data_desc:
+        for row in data_desc:
+            if disease.lower() in str(row.get('Disease', '')).lower():
+                description = str(row.get(desc_col, ''))
+                break
         
     precautions = []
-    if df_prec is not None:
-        prec_row = df_prec[df_prec['Disease'].str.lower().str.contains(disease.lower(), na=False, regex=False)]
-        if not prec_row.empty:
-            for i in range(1, 5):
-                col = f'Precaution_{i}'
-                if col in prec_row.columns and pd.notna(prec_row.iloc[0][col]):
-                    precautions.append(str(prec_row.iloc[0][col]).strip().capitalize())
+    if data_prec:
+        for row in data_prec:
+            if disease.lower() in str(row.get('Disease', '')).lower():
+                for i in range(1, 5):
+                    col = f'Precaution_{i}'
+                    val = str(row.get(col, '')).strip()
+                    if val and val.lower() != 'nan':
+                        precautions.append(val.capitalize())
+                break
                     
     medicines = get_medicines(disease, allergies)
     
@@ -667,6 +686,9 @@ def hybrid_rag_search(user_text: str):
     if not disease_index or bert_model is None or tfidf_vectorizer is None: return None, 0.0
     try:
         import torch
+        import numpy as np
+        from sklearn.metrics.pairwise import cosine_similarity
+        
         inputs = bert_tokenizer(user_text, return_tensors="pt", truncation=True, max_length=128, padding=True)
         with torch.no_grad(): out = bert_model(**inputs)
         
@@ -683,7 +705,6 @@ def hybrid_rag_search(user_text: str):
                 best_score   = hybrid_score
                 best_disease = item["disease"]
                 
-        # Threshold 0.55 (55%) kar diya hai taake sirf confirm match par hi dawai de
         if best_score < 0.55: return None, best_score
         return best_disease, best_score
     except Exception as e:
@@ -762,5 +783,5 @@ def health_check():
         "mode":             "Online (Groq LLM)" if internet else "Offline (Hybrid RAG)",
         "internet":         internet,
         "vectors_indexed":  len(disease_index),
-        "version":          "8.5.0 — Super Smart Allergy Filter Added"
+        "version":          "8.5.1 — Super Smart Allergy Filter Added & Vercel Optimized"
     }
