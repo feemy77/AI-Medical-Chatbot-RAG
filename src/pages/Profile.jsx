@@ -5,7 +5,7 @@ import { useNavigate, Link } from 'react-router-dom';
 import { auth } from '../firebase';
 import { signOut } from 'firebase/auth';
 
-const BACKEND_URL = 'http://localhost:8000'; // Backend URL
+const BACKEND_URL = '';// Backend URL
 
 export default function Profile() {
   const navigate = useNavigate();

@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-const BACKEND_URL = 'http://localhost:8000';
-
+const BACKEND_URL = '';
 export default function Chat() {
   const navigate = useNavigate();
   const userEmail = localStorage.getItem('aiMedicalUserEmail') || '';
