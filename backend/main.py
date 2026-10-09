@@ -24,23 +24,50 @@ CACHE_FILE  = os.path.join(BASE_DIR, "bert_clinicalbert_cache.pkl")
 
 # ── INTERNET CHECK ─────────────────────────────────────────────────────────────
 def check_internet() -> bool:
-    try:
-        urllib.request.urlopen("https://www.google.com", timeout=3)
+    # If running in Vercel or any cloud serverless environment, internet is always available
+    if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
         return True
-    except:
-        return False
+    try:
+        req = urllib.request.Request(
+            "https://www.google.com",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        try:
+            req = urllib.request.Request(
+                "https://1.1.1.1",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
 
-# ── GROQ SETUP ─────────────────────────────────────────────────────────────────
+# ── GROQ SETUP & DYNAMIC CLIENT ─────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 groq_client  = None
 
-if GROQ_API_KEY:
+def get_groq_client():
+    global groq_client
+    if groq_client is not None:
+        return groq_client
+    
+    key = os.getenv("GROQ_API_KEY", "").strip() or os.getenv("GROQ_KEY", "").strip()
+    if not key:
+        return None
     try:
         from groq import Groq
-        groq_client = Groq(api_key=GROQ_API_KEY, timeout=15.0)
+        groq_client = Groq(api_key=key, timeout=25.0)
         print("✅ Groq API Ready! (Using Llama-3.3-70B)")
+        return groq_client
     except Exception as e:
         print(f"⚠️  Groq setup error: {e}")
+        return None
+
+if GROQ_API_KEY:
+    get_groq_client()
 
 # ── CSV LOADER (NO PANDAS) ─────────────────────────────────────────────────────
 def read_csv_safe(filepath):
@@ -428,7 +455,10 @@ def get_emergency_response(category: str, lang: str) -> str:
 
 # ── GROQ RESPONSE ──────────────────────────────────────────────────────────────
 def get_groq_response(user_text: str, allergies: str, conversation: list) -> str:
-    if not groq_client: return None
+    client = get_groq_client()
+    if not client:
+        print("⚠️ Groq client unavailable: GROQ_API_KEY missing in environment variables!")
+        return None
     lang = detect_language(user_text)
     
     if lang == "english":
@@ -498,7 +528,7 @@ Known Allergies: {allergies}"""
     messages.append({"role": "user", "content": reinforced_text})
     
     try:
-        completion = groq_client.chat.completions.create(messages=messages, model="llama-3.3-70b-versatile", temperature=0.2)
+        completion = client.chat.completions.create(messages=messages, model="llama-3.3-70b-versatile", temperature=0.2)
         result = completion.choices[0].message.content.strip().replace("*", "")
         
         refusal_markers   = ["specialized Medical AI Chatbot designed exclusively", "Main ek Medical Chatbot hoon jo sirf tibbi"]
@@ -510,12 +540,12 @@ Known Allergies: {allergies}"""
         
         if (is_refusal and has_symptom) or is_wrong_lang:
             retry_msgs = [{"role": "system", "content": system_prompt}, {"role": "user", "content": reinforced_text}]
-            retry      = groq_client.chat.completions.create(messages=retry_msgs, model="llama-3.3-70b-versatile", temperature=0.2)
+            retry      = client.chat.completions.create(messages=retry_msgs, model="llama-3.3-70b-versatile", temperature=0.2)
             return retry.choices[0].message.content.strip().replace("*", "")
             
         return result
     except Exception as e:
-        print(f"⚠️  Groq error: {e}")
+        print(f"⚠️  Groq API Error: {type(e).__name__}: {e}")
         return None
 
 # ── OFFLINE DIRECT SYMPTOMS ────────────────────────────────────────────────────
@@ -671,9 +701,16 @@ def get_diagnosis(request: ConsultationRequest):
     source        = "unknown"
     
     # ── ONLINE: Groq handles everything ───────────────────────────────────────
-    if internet and groq_client:
+    client = get_groq_client()
+    if client:
         response_text = get_groq_response(user_text, allergies, conversation)
-        if response_text: source = "groq_llama3_70b"
+        if response_text:
+            source = "groq_llama3_70b"
+        else:
+            print("⚠️ Online Groq call returned None, falling back to offline...")
+    else:
+        if internet:
+            print("⚠️ [WARNING] Device has internet access, but GROQ_API_KEY is not configured in Vercel environment variables!")
         
     # ── OFFLINE: Local system ──────────────────────────────────────────────────
     if not response_text:
@@ -711,14 +748,47 @@ def get_diagnosis(request: ConsultationRequest):
     save_to_db(user_text, allergies, source, response_text)
     return ConsultationResponse(ai_response=response_text, source=source, timestamp=timestamp)
 
+# ── DIAGNOSTIC / DEBUG ENDPOINT ────────────────────────────────────────────────
+@app.get("/api/debug")
+def debug_status():
+    api_key = os.getenv("GROQ_API_KEY", "").strip() or os.getenv("GROQ_KEY", "").strip()
+    has_key = bool(api_key)
+    masked_key = (api_key[:6] + "..." + api_key[-4:]) if len(api_key) > 10 else ("Configured" if api_key else "NOT SET")
+    client = get_groq_client()
+    
+    test_result = "Not attempted (client not ready - GROQ_API_KEY is missing)"
+    if client:
+        try:
+            resp = client.chat.completions.create(
+                messages=[{"role": "user", "content": "hi"}],
+                model="llama-3.3-70b-versatile",
+                max_tokens=10
+            )
+            test_result = f"SUCCESS: {resp.choices[0].message.content.strip()}"
+        except Exception as err:
+            test_result = f"ERROR: {type(err).__name__}: {str(err)}"
+            
+    return {
+        "is_vercel": bool(os.getenv("VERCEL")),
+        "groq_api_key_set": has_key,
+        "groq_key_preview": masked_key,
+        "groq_client_ready": bool(client),
+        "groq_test_call": test_result,
+        "offline_vector_cache_available": os.path.exists(CACHE_FILE),
+        "version": "8.6.0 — Resilient Groq & Vercel Diagnostics"
+    }
+
 # ── HEALTH CHECK ───────────────────────────────────────────────────────────────
 @app.get("/")
 def health_check():
+    client = get_groq_client()
     internet = check_internet()
     return {
         "status":           "Active",
-        "mode":             "Online (Groq LLM)" if internet else "Offline (Hybrid RAG)",
+        "mode":             "Online (Groq Llama-3.3-70B)" if client else "Offline (Direct Fallback)",
+        "groq_ready":       bool(client),
         "internet":         internet,
+        "is_vercel":        bool(os.getenv("VERCEL")),
         "vectors_indexed":  len(disease_index),
-        "version":          "8.5.2 — Vercel Bulletproof Stable Version"
+        "version":          "8.6.0 — Vercel Bulletproof Stable Version"
     }
