@@ -453,6 +453,66 @@ def get_emergency_response(category: str, lang: str) -> str:
     else:
         return "🚨 THIS MAY BE A MEDICAL EMERGENCY\n──────────────────────────────\nThe symptoms you've described may require immediate professional attention.\n\n⚠️ PLEASE GO TO THE NEAREST HOSPITAL OR CALL EMERGENCY SERVICES (1122) RIGHT AWAY.\n──────────────────────────────\n• Do not drive yourself — get someone to help\n• Do not leave the person alone\n• This chatbot cannot treat emergencies"
 
+# ── DYNAMIC MODEL SELECTOR & RETRY ─────────────────────────────────────────────
+_cached_groq_model = None
+
+AVAILABLE_GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it"
+]
+
+def get_active_groq_model(client):
+    global _cached_groq_model
+    if _cached_groq_model:
+        return _cached_groq_model
+    try:
+        remote_models = [m.id for m in client.models.list().data]
+        for candidate in AVAILABLE_GROQ_MODELS:
+            if candidate in remote_models:
+                _cached_groq_model = candidate
+                print(f"🎯 Auto-selected Groq Model: {_cached_groq_model}")
+                return _cached_groq_model
+        for m_id in remote_models:
+            if any(term in m_id for term in ["llama", "mixtral", "gemma"]):
+                _cached_groq_model = m_id
+                return _cached_groq_model
+        _cached_groq_model = remote_models[0] if remote_models else "llama-3.1-8b-instant"
+        return _cached_groq_model
+    except Exception as e:
+        print(f"⚠️ Model list query failed ({e}), using default llama-3.1-8b-instant")
+        _cached_groq_model = "llama-3.1-8b-instant"
+        return _cached_groq_model
+
+def execute_groq_chat(client, messages, temperature=0.2, max_tokens=None):
+    model = get_active_groq_model(client)
+    kwargs = {"messages": messages, "model": model, "temperature": temperature}
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+        
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "model_not_found" in err_msg or "does not exist" in err_msg:
+            print(f"⚠️ Model '{model}' not found. Trying fallbacks...")
+            for fallback in ["llama-3.1-8b-instant", "llama-3.1-70b-versatile", "llama3-70b-8192", "llama3-8b-8192"]:
+                if fallback != model:
+                    try:
+                        kwargs["model"] = fallback
+                        resp = client.chat.completions.create(**kwargs)
+                        global _cached_groq_model
+                        _cached_groq_model = fallback
+                        print(f"✅ Successfully switched to fallback model: {fallback}")
+                        return resp
+                    except Exception:
+                        continue
+        raise e
+
 # ── GROQ RESPONSE ──────────────────────────────────────────────────────────────
 def get_groq_response(user_text: str, allergies: str, conversation: list) -> str:
     client = get_groq_client()
@@ -528,7 +588,7 @@ Known Allergies: {allergies}"""
     messages.append({"role": "user", "content": reinforced_text})
     
     try:
-        completion = client.chat.completions.create(messages=messages, model="llama-3.3-70b-versatile", temperature=0.2)
+        completion = execute_groq_chat(client, messages=messages, temperature=0.2)
         result = completion.choices[0].message.content.strip().replace("*", "")
         
         refusal_markers   = ["specialized Medical AI Chatbot designed exclusively", "Main ek Medical Chatbot hoon jo sirf tibbi"]
@@ -540,7 +600,7 @@ Known Allergies: {allergies}"""
         
         if (is_refusal and has_symptom) or is_wrong_lang:
             retry_msgs = [{"role": "system", "content": system_prompt}, {"role": "user", "content": reinforced_text}]
-            retry      = client.chat.completions.create(messages=retry_msgs, model="llama-3.3-70b-versatile", temperature=0.2)
+            retry      = execute_groq_chat(client, messages=retry_msgs, temperature=0.2)
             return retry.choices[0].message.content.strip().replace("*", "")
             
         return result
@@ -757,25 +817,35 @@ def debug_status():
     client = get_groq_client()
     
     test_result = "Not attempted (client not ready - GROQ_API_KEY is missing)"
+    active_model = "None"
+    available_models = []
+    
     if client:
         try:
-            resp = client.chat.completions.create(
+            available_models = [m.id for m in client.models.list().data][:10]
+        except Exception:
+            pass
+        try:
+            resp = execute_groq_chat(
+                client,
                 messages=[{"role": "user", "content": "hi"}],
-                model="llama-3.3-70b-versatile",
                 max_tokens=10
             )
-            test_result = f"SUCCESS: {resp.choices[0].message.content.strip()}"
+            active_model = get_active_groq_model(client)
+            test_result = f"SUCCESS ({active_model}): {resp.choices[0].message.content.strip()}"
         except Exception as err:
             test_result = f"ERROR: {type(err).__name__}: {str(err)}"
+            active_model = get_active_groq_model(client)
             
     return {
         "is_vercel": bool(os.getenv("VERCEL")),
         "groq_api_key_set": has_key,
         "groq_key_preview": masked_key,
         "groq_client_ready": bool(client),
+        "active_model": active_model,
         "groq_test_call": test_result,
-        "offline_vector_cache_available": os.path.exists(CACHE_FILE),
-        "version": "8.6.0 — Resilient Groq & Vercel Diagnostics"
+        "available_models_sample": available_models,
+        "version": "8.6.1 — Multi-Model Auto Fallback & Diagnostics"
     }
 
 # ── HEALTH CHECK ───────────────────────────────────────────────────────────────
@@ -783,12 +853,13 @@ def debug_status():
 def health_check():
     client = get_groq_client()
     internet = check_internet()
+    active_model = get_active_groq_model(client) if client else "None"
     return {
         "status":           "Active",
-        "mode":             "Online (Groq Llama-3.3-70B)" if client else "Offline (Direct Fallback)",
+        "mode":             f"Online (Groq {active_model})" if client else "Offline (Direct Fallback)",
         "groq_ready":       bool(client),
         "internet":         internet,
         "is_vercel":        bool(os.getenv("VERCEL")),
         "vectors_indexed":  len(disease_index),
-        "version":          "8.6.0 — Vercel Bulletproof Stable Version"
+        "version":          "8.6.1 — Vercel Bulletproof Stable Version"
     }
