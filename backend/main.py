@@ -456,15 +456,25 @@ def get_emergency_response(category: str, lang: str) -> str:
 # ── DYNAMIC MODEL SELECTOR & RETRY ─────────────────────────────────────────────
 _cached_groq_model = None
 
-AVAILABLE_GROQ_MODELS = [
+PREFERRED_CHAT_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-70b-versatile",
     "llama-3.1-8b-instant",
     "llama3-70b-8192",
     "llama3-8b-8192",
+    "meta-llama/llama-3.3-70b-instruct",
+    "meta-llama/llama-3.1-70b-instruct",
+    "meta-llama/llama-3.1-8b-instruct",
+    "deepseek-r1-distill-llama-70b",
+    "qwen/qwen-2.5-32b",
     "mixtral-8x7b-32768",
     "gemma2-9b-it"
 ]
+
+def is_valid_chat_model(m_id: str) -> bool:
+    m_lower = m_id.lower()
+    blocked = ["guard", "whisper", "orpheus", "safeguard", "embed", "audio", "tts"]
+    return not any(b in m_lower for b in blocked)
 
 def get_active_groq_model(client):
     global _cached_groq_model
@@ -472,16 +482,27 @@ def get_active_groq_model(client):
         return _cached_groq_model
     try:
         remote_models = [m.id for m in client.models.list().data]
-        for candidate in AVAILABLE_GROQ_MODELS:
-            if candidate in remote_models:
+        
+        # 1. First priority: Check preferred chat list
+        for candidate in PREFERRED_CHAT_MODELS:
+            if candidate in remote_models and is_valid_chat_model(candidate):
                 _cached_groq_model = candidate
                 print(f"🎯 Auto-selected Groq Model: {_cached_groq_model}")
                 return _cached_groq_model
-        for m_id in remote_models:
-            if any(term in m_id for term in ["llama", "mixtral", "gemma"]):
+                
+        # 2. Second priority: Any valid chat model with llama, mixtral, gemma, qwen
+        chat_candidates = [m for m in remote_models if is_valid_chat_model(m)]
+        for m_id in chat_candidates:
+            if any(term in m_id.lower() for term in ["llama-3", "llama3", "mixtral", "gemma", "qwen", "deepseek"]):
                 _cached_groq_model = m_id
                 return _cached_groq_model
-        _cached_groq_model = remote_models[0] if remote_models else "llama-3.1-8b-instant"
+                
+        # 3. Fallback to first valid chat model
+        if chat_candidates:
+            _cached_groq_model = chat_candidates[0]
+            return _cached_groq_model
+            
+        _cached_groq_model = "llama-3.1-8b-instant"
         return _cached_groq_model
     except Exception as e:
         print(f"⚠️ Model list query failed ({e}), using default llama-3.1-8b-instant")
@@ -822,7 +843,7 @@ def debug_status():
     
     if client:
         try:
-            available_models = [m.id for m in client.models.list().data][:10]
+            available_models = [m.id for m in client.models.list().data if is_valid_chat_model(m.id)]
         except Exception:
             pass
         try:
@@ -844,8 +865,8 @@ def debug_status():
         "groq_client_ready": bool(client),
         "active_model": active_model,
         "groq_test_call": test_result,
-        "available_models_sample": available_models,
-        "version": "8.6.1 — Multi-Model Auto Fallback & Diagnostics"
+        "available_chat_models": available_models,
+        "version": "8.6.2 — Pure Chat Model Selection & Diagnostics"
     }
 
 # ── HEALTH CHECK ───────────────────────────────────────────────────────────────
